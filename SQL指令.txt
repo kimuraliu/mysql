@@ -1,0 +1,123 @@
+SQL 語法查詢網站
+
+http://tw.gitbook.net/sql/index.html
+https://www.1keydata.com/tw/sql/sql.html
+
+https://www.finereport.com/tw/data-analysis/sql-tableau-finereport-power-bi-learning.html
+-------------------------------------------------
+MySQL 各種超時參數的含義
+https://www.cnblogs.com/xiaoboluo768/p/6222862.html
+
+-------------------------------------------------
+order by兩個欄位同時排序
+
+ORDER BY  後可加2個欄位,用英文逗號隔開。
+
+f1用升序, f2降序,sql該這樣寫
+
+ORDER BY  f1, f2  DESC
+
+也可以這樣寫,更清楚:
+
+ORDER BY  f1 ASC, f2  DESC
+
+如果都用降序,必須用兩個desc
+
+ORDER BY  f1 DESC, f2 DESC
+
+-------------------------------------------------
+MySQL查詢根據名欄位重複內容只顯示最新的一條
+SELECT * FROM user_bindcard_info WHERE 
+(
+id IN ( SELECT MAX(id) FROM user_bindcard_info 
+WHERE (vip_id IN(1000000006,1000000009,654323)) GROUP BY card_no )
+) ORDER BY id ASC LIMIT 5
+-------------------------------------------------
+多對多的關聯建立與查詢
+
+假設一個情況：我正在維護一個系統而裡頭有許多筆玩家的資料皆存在Players這張TABLE，
+而玩家的目的就是在收集優待券（存在Coupon這張TABLE），而一個玩家會有很多Coupons，
+相對地同一Coupon也會被許多玩家擁有，那麼該如何建立這種都對多關聯呢？
+
+CREATE TABLE Players(
+ p_id INT NOT NULL,
+ p_name VARCHAR(20) NOT NULL,
+ p_createDate TIMESTAMP NOT NULL,
+ PRIMARY KEY(p_id)
+);
+
+CREATE TABLE Coupons(
+ c_id INT NOT NULL auto_increment,
+ c_description TEXT NOT NULL,
+ c_photoLink VARCHAR(25),
+ PRIMARY KEY(c_id)
+);
+
+CREATE TABLE PlayerOfCoupon(
+ playerId INT NOT NULL REFERENCES Players (p_id) ON DELETE CASCADE,
+ couponId INT NOT NULL REFERENCES Coupons (c_id) ON DELETE CASCADE
+);
+
+在PlayerOfCoupon的建立SQL裡，可以發現我們使用ON DELETE CASCADE，
+主要是因為假設當Players或Coupons裡的某一筆資料若被刪除，那麼PlayerOfCoupon裡有參考到這筆資料的部分也該被刪除。
+
+而下面這段則是查詢的SQL，運用Inner Join去Join Players 跟 Coupons這兩張表格並取出想要的欄位資訊。
+
+SELECT PlayerOfCoupon.*,
+    Players.p_name AS playerName,
+    Coupons.c_description AS CouponDesc
+FROM Players
+INNER JOIN (PlayerOfCoupon
+    INNER JOIN Coupons
+    ON PlayerOfCoupon.couponId = Coupons.c_id
+)
+ON PlayerOfCoupon.playerId = Players.p_id
+
+---------------------------------------
+
+今天在測試資料庫刪除資料時，發現了一件事
+
+在有被其他資料表 Reference 成 Foreign Key 的情況下刪除資料時資料庫會發出：
+
+Cannot delete or update a parent row: a foreign key constraint fails
+
+後來才發現在建立資料庫時，如果不會自己的 Foreign Key 設定動作的話，資料庫預設是不會做連動的更改( NO ACTION )。
+
+
+CREATE TABLE parent(
+   id INT NOT NULL,
+   PRIMARY KEY (id)
+) TYPE = INNODB;
+
+CREATE TABLE child(
+   id INT,
+   parent_id INT,
+   INDEX par_ind (parent_id),
+   FOREIGN KEY(parent_id) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASADE
+) TYPE = INNODB;
+
+
+
+可以下的參數有：
+
+[ON DELETE {CASCADE | SET NULL | NO ACTION | RESTRICT}]
+[ON UPDATE {CASCADE | SET NULL | NO ACTION | RESTRICT}]
+
+參數解釋：
+
+CASCADE - 會將有所關聯的紀錄行也會進行刪除或修改。
+
+SET NULL - 會將有所關聯的紀錄行設定成 NULL。
+
+NO ACTION - 有存在的關聯紀錄行時，會禁止父資料表的刪除或修改動作。
+
+RESTRICT - 與 NO ACTION 相同。
+
+ 
+
+詳細的錯誤訊息可以在 MySQL 指令模式下輸入：
+
+---------------------------------------
+
+將某個欄位修改為null（從不允許為空not null修改為 null）
+
