@@ -1,0 +1,1124 @@
+資料來源：https://www.cnblogs.com/xiaoboluo768/p/6222862.html
+
+今日在查看鎖超時的設置時，看到show variables like '%timeout%';語句輸出結果中的十幾種超時參數時突然想整理一下，不知道大家有沒有想過，這麼多的timeout參數，到底有什麼區別，都是做什麼用的呢？
+MySQL [(none)]> show variables like '%timeout%';
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |
++------------------------------+----------+
+13 rows in set (0.00 sec)
+PS：文檔說明
+根據這些參數的global和session級別分別進行闡述
+基於MySQL 5.6.30編寫
+加載了半同步複製插件，所以才能看到半同步相關的參數
+驗證演示過程可能會打開兩個MySQL會話進行驗證，也可能只打開一個MySQL會話進行驗證
+只針對大家平時容易高混淆的或者說不好理解的超時參數做步驟演示，容易理解的超時參數只做文字描述，不做步驟演示
+大部分參數基於MySQL命令行客戶端做的演示，但wait_timeout和interactive_timeout這兩個比較特殊，為了對比不同客戶端的差異，還使用了python演示
+1、連接、網絡類超時
+共有如下幾個：
+connect_timeout：默認為10S
+wait_timeout：默認是8小時，即28800秒
+interactive_timeout：默認是8小時，即28800秒
+net_read_timeout：默認是30S
+net_write_timeout：默認是60S
+1.1. 針對網絡類超時參數，先簡單梳理一下在MySQL建立連接、發送數據包的整個過程中，每一個階段都用到了哪些超時參數
+a)、connect_timeout：在獲取連接階段（authenticate）起作用
+
+獲取MySQL連接是多次握手的結果，除了用戶名和密碼的匹配校驗外，還有IP->HOST->DNS->IP驗證，任何一步都可能因為網絡問題導致線程阻塞。為了防止線程浪費在不必要的校驗等待上，超過connect_timeout的連接請求將會被拒絕。
+官方描述：connect_timeout（mysqld 服務器在響應 Bad handshake 之前等待連接數據包的秒數。默認值為 10 秒）
+b)、interactive_timeout和wait_timeout：在連接空閒階段（sleep）起作用
+
+即使沒有網絡問題，也不能允許客戶端一直佔用連接。對於保持sleep狀態超過了wait_timeout（或interactive_timeout，取決於client_interactive標誌）的客戶端，MySQL會主動斷開連接。
+
+官方描述：
+
+wait_timeout：服務器在關閉非交互式連接之前等待活動的秒數。在線程啟動時，會話 wait_timeout 值從全局 wait_timeout 值或全局 interactive_timeout 值初始化，這取決於客戶端的類型（由 CLIENT_INTERACTIVE 連接選項定義到 mysql_real_connect()）。
+
+interactive_timeout：服務器在關閉交互式連接之前等待其活動的秒數。交互式客戶端定義為對 mysql_real_connect() 使用 CLIENT_INTERACTIVE 選項的客戶端
+
+c)、net_read_timeout和net_write_timeout：則是在連接繁忙階段（query）起作用。
+
+即使連接沒有處於sleep狀態，即客戶端忙於計算或者存儲數據，MySQL也選擇了有條件的等待。在數據包的分發過程中，客戶端可能來不及響應（發送、接收、或者處理數據包太慢）。
+為了保證連接不被浪費在無盡的等待中，MySQL也會選擇有條件（net_read_timeout和net_write_timeout）地主動斷開連接。
+這個參數只對TCP/IP鏈接有效，只針對在Activity狀態下的線程有效
+官方描述：
+net_read_timeout：在中止讀取之前等待來自連接的更多數據的秒數。當服務器正在從客戶端讀取時，net_read_timeout 是控制何時中止的超時值。當服務器正在向客戶端寫入時，net_write_timeout 是控制何時中止的超時值
+net_write_timeout：在中止寫入之前等待塊寫入連接的秒數。另見 net_read_timeout。
+d)、 handshake流程
+
+在TCP三次握手的基礎之上，簡歷MySQL通訊協議的連接，這個連接建立過程受connect_timeout參數控制
+--------------------TCP established--------------------
+MySQL Server(10.10.20.96)------->Client(10.10.20.51)
+Client(10.10.20.51)------->MySQL Server(10.10.20.96)
+MySQL Server(10.10.20.96)------->Client(10.10.20.51)
+- - - - - - - - - - 已確立的 - - - - - - - - - -
+
+在MySQL通訊協議建立連接之後，此時客戶端連接的超時受wait_timeout和interactive_timeout參數控制
+建立連接後無交互：MySQL server ---wait_timeout--- Client
+建立連接交互後：MySQL server ---interactive_timeout--- Client
+
+在如果客戶端有數據包傳輸，那麼這個數據包的傳輸超時由net_read_timeout和net_write_timeout參數控制
+-------------------client與server端有數據傳輸時-------------------
+client ----->MySQL Server(net_read_timeout)
+client <-----MySQL Server(net_write_timeout)
+
+1.2. connect_timeout：該參數沒有session級別，是一個global級別變量
+## 使用mysql客户端打开一个会话，并设置全局 connect_timeout=5
+MySQL [(none)]> set global connect_timeout=5;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> 
+
+## 由于mysql客户端不是很好模拟连接阶段（authenticate）的超时，所以使用telnet来发包给mysql，因为telnet的包并不遵循mysql的通讯协议
+[root@localhost ~]# time telnet 127.0.0.1 3306
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+N
+5.6.30-logwA{k)'&)S9#A`?Z&O9pJ`mysql_native_passwordConnection closed by foreign host.
+
+real	0m5.022s  #这里可以看到5S之后连接断开
+user	0m0.000s
+sys	0m0.010s
+
+## 回到mysql客户端：修改全局 connect_timeout为10S
+MySQL [(none)]> set global connect_timeout=10;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> 
+
+## 使用telnet再试一次
+[root@localhost ~]# time telnet 127.0.0.1 3306
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+N
+5.6.30-loggZoA3{6:S\D}iu3;n:uafmysql_native_passwordConnection closed by foreign host.
+
+real	0m10.012s
+user	0m0.000s
+sys	0m0.002s
+從上面的結果中可以看到，MySQL客戶端與服務端的連接階段（authenticate）的超時由參數connect_timeout控制。
+1.3. interactive_tineout和wait_timeout參數
+1.3.1. interactive_timeout：（MySQL命令行客戶端）
+1.3.1.1. session級別修改interactive_timeout
+## 打开第一个会话，设置session级别的interactive_timeout=2
+MySQL [(none)]> set session interactive_timeout=2;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> select sleep(3);show session variables like '%timeout%';show global variables like '%timeout%';
++----------+
+| sleep(3) |
++----------+
+|        0 |
++----------+
+1 row in set (3.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 2        |  #session级别的interactive_timeout改变了
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #session级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #global级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #global级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+## 打开第二个会话，执行show语句
+MySQL [(none)]> show session variables like '%timeout%';show global variables like '%timeout%';
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #session级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #session级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #global级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #global级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+從上面的結果可以看到，設置session級別的interactive_timeout對wait_timeout的session和global級別都沒有影響
+1.3.1.2. global級別修改interactive_timeout
+### 回到第一个会话中，设置global interactive_timeout=20
+MySQL [(none)]> set global interactive_timeout=20;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> select sleep(3);show session variables like '%timeout%';show global variables like '%timeout%';
++----------+
+| sleep(3) |
++----------+
+|        0 |
++----------+
+1 row in set (3.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 2        |  #session级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #session级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 20       |  #global级别的interactive_timeout改变了
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #global级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+# 第二个会话断开之后重连，再执行show语句
+MySQL [(none)]> show session variables like '%timeout%';show global variables like '%timeout%';
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 20       |  #session级别的interactive_timeout改变了
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 20       |  #session级别的wait_timeout改变了
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 20       |  #global级别的interactive_timeout改变了
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #global级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+從上面的結果中可以看到：如果改變了global級別的interactive_timeout值，對當前連接不生效，對後續新連接的wait_timeout的session級別生效，global級別不生效，interactive_timeout的global級別和session級別都生效
+1.3.2. wait_timeout：（MySQL命令行客戶端）
+1.3.2.1. session級別修改wait_timeout
+這里為了驗證後續的值不產生混亂，先把interactive_timeout的值恢復為172800並重連連接(connect_timeout默認是10，此時已經是這個值了，不用再修改)，然後再修改wait_timeout
+MySQL [(none)]> set global interactive_timeout=172800;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> Ctrl-C -- exit!
+Aborted
+[root@localhost ~]# mysql -uqogir_env -p'letsg0' -S /home/mysql/data/mysqldata1/sock/mysql.sock 
+Welcome to the MariaDB monitor.  Commands end with ; or \g.
+Your MySQL connection id is 21
+Server version: 5.6.30-log MySQL Community Server (GPL)
+
+Copyright (c) 2000, 2016, Oracle, MariaDB Corporation Ab and others.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+MySQL [(none)]> show session variables like '%timeout%';show global variables like '%timeout%';
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+現在，開始1.3.2.小節的驗證
+
+# 打开第一个会话，修改session级别wait_timeout=2
+MySQL [(none)]> set session wait_timeout=2;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> select sleep(3);show session variables like '%timeout%';show global variables like '%timeout%';
+ERROR 2006 (HY000): MySQL server has gone away
+No connection. Trying to reconnect...
+Connection id:    22
+Current database: *** NONE ***  #从这里可以看到，当前连接被断开并重连了
+
++----------+
+| sleep(3) |
++----------+
+|        0 |
++----------+
+1 row in set (3.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #重连之后的session级别参数， interactive_timeout 没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #重连之后的session级别参数，wait_timeout恢复了172800
++------------------------------+----------+
+13 rows in set (0.01 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #重连之后的global级别参数， interactive_timeout 没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   | #重连之后的global级别参数，wait_timeout恢复了172800，即新的连接不受影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+# 打开第二个会话，第二个会话注意要重连
+MySQL [(none)]> show session variables like '%timeout%';show global variables like '%timeout%';
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #session级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #session级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #global级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   | #global级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+# 对于超时断开的连接，错误日志中会报如下错误：
+2016-11-07 19:08:24 3391 [Warning] Aborted connection 21 to db: 'unconnected' user: 'qogir_env' host: 'localhost' (Got timeout reading communication packets)
+
+從上面的結果中可以看到：
+session級別的wait_timeout變量在連接初始化時，繼承global的interactive_timeout參數值
+session級別的wait_timeout對當前交互連接生效（即當前連接的超時使用的是session wait_timeout，session interactive_timeout不生效）
+有一點要注意，如果是新的連接（即斷開重連的或者新的連接），session級別的wait_timeout會使用global級別的interactive_timeout值覆蓋，因為interactive_timeout值是對後續新連接生效(參考1.2.2小節驗證過程)
+1.3.2.2. global級別修改wait_timeout
+
+# 打开第一个会话，修改global wait_timeout=2
+MySQL [(none)]> set global wait_timeout=2;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [(none)]> select sleep(3);show session variables like '%timeout%';show global variables like '%timeout%';
++----------+
+| sleep(3) |
++----------+
+|        0 |
++----------+
+1 row in set (3.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #session级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #session级别的wait_timeout没有影响
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #global级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 2        |  #global级别的wait_timeout改变了
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+# 打开第二个会话，注意需要断开重连，再执行show语句
+MySQL [(none)]> show session variables like '%timeout%';show global variables like '%timeout%';
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #session级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 172800   |  #session级别的wait_timeout没有影响，因为前面说过，这里新连接的session的wait_timeout会继承global interactive_timeout的值
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
++------------------------------+----------+
+| Variable_name                | Value    |
++------------------------------+----------+
+| connect_timeout              | 10       |
+| delayed_insert_timeout       | 300      |
+| innodb_flush_log_at_timeout  | 1        |
+| innodb_lock_wait_timeout     | 120      |
+| innodb_rollback_on_timeout   | ON       |
+| interactive_timeout          | 172800   |  #global级别的interactive_timeout没有影响
+| lock_wait_timeout            | 31536000 |
+| net_read_timeout             | 30       |
+| net_write_timeout            | 60       |
+| rpl_semi_sync_master_timeout | 10000    |
+| rpl_stop_slave_timeout       | 31536000 |
+| slave_net_timeout            | 10       |
+| wait_timeout                 | 2        |  #global级别的wait_timeout改变了
++------------------------------+----------+
+13 rows in set (0.00 sec)
+
+從上面的結果中可以看到：global級別的wait_timeout變量在初始化時，繼承global的wait_timeout參數值，默認8小時
+1.3.3. interactive_timeout和wait_timeout參數（python MySQL driver）
+本小節演示的python代碼如下：
+
+#cat test_timeout.py 
+#!/bin/env python
+# coding=utf8
+
+import MySQLdb
+import sys
+import time
+
+# 设置wait_timeout的值
+wait_timeout=5
+
+# 设置interactive_timeout的侄
+interactive_timeout=10
+
+# MySQL帐号
+mysql_user='qbench'
+
+# MySQL密码
+mysql_password='qbench'
+
+# MySQL ip地址
+mysql_ip='10.10.30.68'
+
+
+
+
+rest_conn = MySQLdb.connect(user=mysql_user,passwd=mysql_password,host=mysql_ip)
+rest_cur = rest_conn.cursor()
+rest_cur.execute("show variables like '%timeout%';")
+datas = rest_cur.fetchall()
+datas = dict(datas)
+    
+rest_wait_timeout = datas['wait_timeout']
+rest_interactive_timeout = datas['interactive_timeout']
+
+rest_cur.close()
+rest_conn.close()
+
+
+def new_connect(info,timeout):
+    new_conn = MySQLdb.connect(user=mysql_user,passwd=mysql_password,host=mysql_ip)
+    new_cur = new_conn.cursor()
+    print '%s \n%s' % ('-' * 50,str(info))
+    #sql = "select sleep(%s);" % int(timeout+1)
+    #print "执行sleep sql语句：%s" % str(sql)
+    new_cur.execute("show variables like '%timeout%';")
+    new_datas = new_cur.fetchall()
+    new_datas = dict(new_datas)
+    
+    print 'wait_timeout=%s' % new_datas['wait_timeout']
+    print 'interactive_timeout=%s' % new_datas['interactive_timeout']
+
+    print "sleep %s 秒之后再次执行sql---" % int(timeout)
+    time.sleep(int(timeout))
+    #new_cur.execute("%s" % str(sql))
+    new_cur.execute("show variables like '%timeout%';")
+    new_datas = new_cur.fetchall()
+    new_datas = dict(new_datas)
+    
+    print 'wait_timeout=%s' % new_datas['wait_timeout']
+    print 'interactive_timeout=%s' % new_datas['interactive_timeout']
+
+    new_cur.close()
+    new_conn.close()
+
+def current_connect():
+    curr_conn = MySQLdb.connect(user=mysql_user,passwd=mysql_password,host=mysql_ip)
+    curr_cur = curr_conn.cursor()
+    print "在第一个连接中修改global wait_timeout为：%s" % wait_timeout
+    curr_cur.execute("set global wait_timeout=%s;" % wait_timeout)
+    curr_cur.execute("show variables like '%timeout%';")
+    curr_datas1 = curr_cur.fetchall()
+    curr_datas1 = dict(curr_datas1)
+    
+    print "%s\n第一个连接保持不断开的session级别的超时信息：" % ('-' * 100) 
+    print 'wait_timeout=%s' % curr_datas1['wait_timeout']
+    print 'interactive_timeout=%s' % curr_datas1['interactive_timeout']
+
+    new_connect(info='第一个连接修改global wait_timeout为：%s之后，登录新的连接的session级别的超时信息如下：' % wait_timeout,timeout=wait_timeout)
+
+    restore()
+
+    curr_cur.close()
+    curr_cur = curr_conn.cursor()
+    print "在第一个连接中修改global interactive_timeout为：%s" % interactive_timeout
+    curr_cur.execute("set global interactive_timeout=%s;" % interactive_timeout)
+    curr_cur.execute("show variables like '%timeout%';")
+    curr_datas2 = curr_cur.fetchall()
+    curr_datas2 = dict(curr_datas2)
+    
+    print "%s\n第一个连接保持不断开的session级别的超时信息：" % ('-' * 100) 
+    print 'wait_timeout=%s' % curr_datas2['wait_timeout']
+    print 'interactive_timeout=%s' % curr_datas2['interactive_timeout']
+
+    new_connect(info='第一个连接修改global interactive_timeout为：%s之后，登录新的连接的session级别的超时信息如下：' % interactive_timeout,timeout=interactive_timeout)
+
+    curr_cur.close()
+    curr_conn.close()
+
+
+def restore():
+    print "开启新的连接执行恢复参数初始设置----------------------"
+    rest_conn = MySQLdb.connect(user=mysql_user,passwd=mysql_password,host=mysql_ip)
+    rest_cur = rest_conn.cursor()
+    rest_cur.execute("set global wait_timeout=%s,interactive_timeout=%s;" % (rest_wait_timeout,rest_interactive_timeout))
+
+    rest_cur.close()
+    rest_conn.close()
+   
+
+print '=' * 100
+try:
+    current_connect()
+except Exception,e:
+    print e
+else:
+    restore()
+
+print '=' * 100
+
+跑一下這個腳本，打印結果如下：
+
+#python test_timeout.py 
+====================================================================================================
+在第一个连接中修改global wait_timeout为：5
+----------------------------------------------------------------------------------------------------
+第一个连接保持不断开的session级别的超时信息：
+wait_timeout=5
+interactive_timeout=172800
+-------------------------------------------------- 
+第一个连接修改global wait_timeout为：5之后，登录新的连接的session级别的超时信息如下：
+wait_timeout=5
+interactive_timeout=172800
+sleep 5 秒之后再次执行sql---
+(2013, 'Lost connection to MySQL server during query')
+====================================================================================================
+
+從上面的結果中可以看到，第一個會話中修改global wait_timeout=5之後，新的連接上來，超過5秒沒有發送新的數據包，連接就被斷開。
+
+綜合1.3小節演示結果來看
+
+MySQL命令行客戶端下：global級別的interactive_timeout修改對當前連接不生效，但能影響新的連接的globa interactive_timeout、session interactive_timeout、session wait_timeout數值
+
+MySQL命令行客戶端下：session級別的interactive_timeout的修改除了能使session interactive_timeout數值改變之外沒有什麼作用
+
+MySQL命令行客戶端下：global級別的wait_timeout的修改除了能使global wait_timeout數值改變之外沒有什麼作用
+
+MySQL命令行客戶端下：session級別的wait_timeout能改變session wait_timeout數值其對當前連接生效。
+
+python MySQL driver：修改global wait_timeout對當前連接不生效，但能影響新的連接的global wait_timeout、session wait_timeout
+
+python MySQL driver：修改session wait_timeout只對當前連接生效
+
+python MySQL driver：修改global interactive_timeout對當前連接不生效，能影響新的連接的global interactive_timeout、session interactive_timeout
+
+python MySQL driver：修改session interactive_timeout除了能使session interactive_timeout數值改變之外沒有什麼作用
+
+PS：思考？
+
+為什麼MySQL命令行客戶端中新的連接的session wait_timeout不是使用的global wait_timeout的值，而是使用的interactive_timeout的值？但是，為什麼python MySQL driver中，新的連接的session wait_timeout就是按照正常的邏輯使用的是global wait_timeout的值？這裡先賣個關子，問題的答案得去源碼中找，參考鏈接：http://dev.mysql.com/doc/refman/5.6/en/mysql-real-connect.html
+
+1.4. 網絡寫入超時
+mysql服務端向客戶端寫(發送)數據時，服務端等待客戶端響應的超時時間，當服務端正在寫數據到客戶端時，net_write_timeout控制何時超時
+對於這個參數，session和global級別並沒有什麼特別，session級別只對當前連接生效，global級別只對新的連接生效。默認值是60S
+下面使用tc命令模擬網絡延遲來進行演示
+
+## 使用sysbench在MySQL server上造数一张500W行数据的表
+
+## tc命令对MySQL客户端的网卡加延迟
+tc qdisc add dev eth0 root netem delay 1s
+
+## MySQL 客户端登录server，修改net_write_timeout参数为1S
+mysql -uqbench -pqbench -h 10.10.30.68
+mysql > set global net_write_timeout=1;
+Query OK, 0 rows affected (0.00 sec)
+
+## 在MySQL客户端使用mysqldump备份
+[root@20bc83fd-1489-4b60-976b-d1823e7dc36e data] # time mysqldump -uqbench -pqbench -h 10.10.30.68 --single-transaction --master-data=2  sbtest  sbtest2 > sbtest2.sql
+Warning: Using a password on the command line interface can be insecure.
+mysqldump: Error 2013: Lost connection to MySQL server during query when dumping table `sbtest2` at row: 85  #从这里可以看到，不到一分钟时间，连接就被断开了
+
+real	0m54.049s
+user	0m0.009s
+sys	0m0.011s
+
+## MySQL客户端登录server，修改net_write_timeout参数为默认的60S
+mysql -uqbench -pqbench -h 10.10.30.68
+mysql > set global net_write_timeout=60;
+Query OK, 0 rows affected (0.00 sec)
+
+## 在MySQL客户端使用mysqldump重试备份
+[root@20bc83fd-1489-4b60-976b-d1823e7dc36e data]# time mysqldump -uqbench -pqbench -h 10.10.30.68 --single-transaction --master-data=2  sbtest  sbtest2 > sbtest2.sql
+Warning: Using a password on the command line interface can be insecure.
+
+real	14m41.744s
+user	0m18.662s
+sys	0m7.886s
+
+[root@20bc83fd-1489-4b60-976b-d1823e7dc36e data]# ls -lh
+total 963M
+drwxr-xr-x 12 mysql mysql  137 Dec 30 15:04 mysqldata1
+drwxr-xr-x  2 mysql mysql    6 Dec 30 15:04 recovery
+-rw-r--r--  1 root  root  963M Dec 30 15:30 sbtest2.sql  #这里可以看到，消耗15分钟之后，备份成功，备份文件大小接近1G
+[root@20bc83fd-1489-4b60-976b-d1823e7dc36e data]# 
+
+1.5. 網絡讀取超時
+mysql服務端從客戶端讀取（接收）數據時，服務端等待客戶端響應的超時時間，當服務端正在從客戶端讀取數據時，net_read_timeout控制何時超時
+對於這個參數，session和global級別並沒有什麼特別，session級別只對當前連接生效，global級別只對新的連接生效。默認值是30S
+下面接著1.4小節進行演示，使用1.4小節中的備份結果導入數據庫
+
+## MySQL客户端登录server，先查看一下net_read_timeout参数的侄
+Warning: Using a password on the command line interface can be insecure.
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 15453
+Server version: 5.6.30-log MySQL Community Server (GPL)
+
+Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> show variables like '%net_read_timeout%';
++------------------+-------+
+| Variable_name    | Value |
++------------------+-------+
+| net_read_timeout | 30    |
++------------------+-------+
+1 row in set (0.00 sec)
+
+mysql> 
+
+## 现在，把1.4小节备份出来的sbtest2.sql文件导入server中的sbtest库
+[root@20bc83fd-1489-4b60-976b-d1823e7dc36e data]# time mysql -uqbench -pqbench -h 10.10.30.68 sbtest < sbtest2.sql 
+Warning: Using a password on the command line interface can be insecure.
+
+real	37m17.831s  #导入成功，耗时38分钟左右
+user	0m22.797s
+sys	0m3.436s
+
+## 现在，使用MySQL客户端登录server，修改net_read_timeout参数
+[root@555f12f7-850d-4f42-867c-2d12890beb40 data]# mysql -uqbench -pqbench -h 10.10.30.68
+Warning: Using a password on the command line interface can be insecure.
+Welcome to the MySQL monitor.  Commands end with ; or \g.
+Your MySQL connection id is 17040
+Server version: 5.6.30-log MySQL Community Server (GPL)
+
+Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+
+Oracle is a registered trademark of Oracle Corporation and/or its
+affiliates. Other names may be trademarks of their respective
+owners.
+
+Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
+
+mysql> set global net_read_timeout=1;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> 
+
+## 修改tc模拟规则，模拟丢包10%,损坏包20%，延迟2秒，包乱序20%
+tc qdisc del dev eth0 root
+tc qdisc add dev eth0 root netem corrupt 20% loss 10% delay 2s reorder 20%
+
+## 使用备份文件再次尝试导入
+time mysql -uqbench -pqbench -h 10.10.30.68 sbtest < sbtest2.sql 
+
+## 很囧的一个事情发生了。此时反复查看server端的processlist，只发现客户端连接上来了，但是一直是sleep状态
+mysql> show processlist;
++-------+--------+-------------------+--------+---------+------+-------+------------------+
+| Id    | User   | Host              | db     | Command | Time | State | Info             |
++-------+--------+-------------------+--------+---------+------+-------+------------------+
+| 17129 | qbench | 10.10.30.78:16167 | sbtest | Sleep   |  207 |       | NULL             |
+| 17159 | qbench | 10.10.30.68:47148 | NULL   | Query   |    0 | init  | show processlist |
++-------+--------+-------------------+--------+---------+------+-------+------------------+
+2 rows in set (0.00 sec)
+
+mysql> kill 17129;  ## 尝试kill掉这个连接
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> show processlist;
++-------+--------+-------------------+------+---------+------+-------+------------------+
+| Id    | User   | Host              | db   | Command | Time | State | Info             |
++-------+--------+-------------------+------+---------+------+-------+------------------+
+| 17159 | qbench | 10.10.30.68:47148 | NULL | Query   |    0 | init  | show processlist |
++-------+--------+-------------------+------+---------+------+-------+------------------+
+1 row in set (0.00 sec)
+
+mysql> use sbtest
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Database changed
+mysql> select count(*) from sbtest2;  ## 然后再查询一下sbtest2表的数据，发现是空的
++----------+
+| count(*) |
++----------+
+|        0 |
++----------+
+1 row in set (0.00 sec)
+
+## 此时，查看客户端的导入数据的连接
+[root@20bc83fd-1489-4b60-976b-d1823e7dc36e data]# time mysql -uqbench -pqbench -h 10.10.30.68 sbtest < sbtest2.sql 
+ERROR 2006 (HY000) at line 47: MySQL server has gone away  ## 发现断开了，囧。。
+
+real	5m42.419s
+user	0m0.031s
+sys	0m0.017s
+
+從上面的結果中可以看到：修改net_read_timeout=1，並在客戶端導入數據到server的時候，並沒有如預期的超時斷開客戶端連接。猜測可能是客戶端導入數據到server端的時候，server端接收包超時之後沒有發起kill掉客戶端的操作，所以不手動執行一把kill的話，客戶端一直在那裡不動，而server端的連接線程也一直處於sleep狀態
+
+附言：
+
+1.4和1.5小節演示用數據庫帳號權限：SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, INDEX, ALTER, SUPER, LOCK TABLES, PROCESS
+
+與net_read_timeout和net_write_timeout相關的還有一個參數，net_retry_count，官方描述如下：
+If a read or write on a communication port is interrupted, retry this many times before giving up.
+
+2、鎖類超時
+2.1. innodb_lock_wait_timeout
+官方描述：
+InnoDB 事務在放棄之前等待行鎖的時間長度（以秒為單位）
+innodb使用這個參數能夠有效避免在資源有限的情況下產生太多的鎖等待；指的是事務等待獲取資源時等待的最長時間，超過這個時間還未分配到資源則會返回應用失敗；參數的時間單位是秒，最小可設置為1s(一般不會設置得這麼小)，最大可設置1073741824秒（34年，一條語句鎖等待超過30分鐘估計業務該有反饋了），默認安裝時這個值是50s，超過這個時間會報ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+
+## 第一个会话，创建测试数据，并设置innodb_lock_wait_timeout=1
+MySQL [(none)]> use test;
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+
+Database changed
+MySQL [test]> create table test(id int);
+Query OK, 0 rows affected (0.03 sec)
+
+MySQL [test]> insert into test values(1);
+Query OK, 1 row affected (0.01 sec)
+
+MySQL [test]> select * from test;
++------+
+| id   |
++------+
+|    1 |
++------+
+1 row in set (0.00 sec)
+
+MySQL [test]> set innodb_lock_wait_timeout=1;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]> 
+
+## 打开第二个会话，注意第二个会要重连，然后打开一个事务，使用select...for update不提交
+MySQL [test]> use test
+Database changed
+MySQL [test]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]> select * from test where id=1 for update;
++------+
+| id   |
++------+
+|    1 |
++------+
+1 row in set (0.00 sec)
+
+MySQL [test]> 
+
+## 此时 回到第一个会话中，执行相同的select..for update语句，等到1S之后会话超时终止
+MySQL [test]> select * from test where id=1 for update;
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+MySQL [test]> 
+
+對於這個參數，session和global級別並沒有什麼特別，session級別只對當前連接生效，global級別只對新的連接生效
+從上面的結果中可以看到，把innodb_lock_wait_timeout設置為1S之後，對於同一行的操作，鎖等待超過1S就被終止事務了
+附言：
+測試結果是在RR隔離級別下基於innodb表的DML操作
+2.2. innodb_rollback_on_timeout
+官方描述：
+在 MySQL 5.6 中，InnoDB 默認只回滾事務超時的最後一條語句。如果指定 --innodb_rollback_on_timeout，事務超時會導致 InnoDB 中止並回滾整個事務
+默認情況下innodb_lock_wait_timeout 超時後只是超時的sql執行失敗，整個事務並不回滾，也不做提交，如需要事務在超時的時候回滾，則需要設置innodb_rollback_on_timeout=ON，該參數默認為OFF
+
+## 先测试一下innodb_rollback_on_timeout为默认值时的情况，打开第一个会话，显式开启一个事务，插入几行测试数据，不提交：
+MySQL [test]> show variables like '%rollback%';
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| innodb_rollback_on_timeout | OFF   |
+| innodb_rollback_segments   | 128   |
++----------------------------+-------+
+2 rows in set (0.00 sec)
+
+MySQL [test]> use test
+Database changed
+MySQL [test]> show tables;
+Empty set (0.00 sec)
+
+MySQL [test]> create table test(id int);
+Query OK, 0 rows affected (0.05 sec)
+
+MySQL [test]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]>insert into test(id) values(1),(2),(3),(4);
+Query OK, 1 row affected (0.00 sec)
+
+MySQL [test]> select * from test;
++------+
+| id   |
++------+
+|    1 |
+|    2 |
+|    3 |
+|    4 |
++------+
+4 rows in set (0.00 sec)
+
+## 现在，打开第二个会话，显式开启一个事务，并插入数据5，不提交
+MySQL [(none)]> use test
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+MySQL [(none)]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]> insert into test values(5);
+Query OK, 1 row affected (0.00 sec)
+
+MySQL [test]> select * from test;
++------+
+| id   |
++------+
+|    5 |
++------+
+2 rows in set (0.00 sec)
+
+## 再回到第一个会话中，更新id为5的数据行为6
+MySQL [test]> update test set id=6 where id=5;  #因为第二个会话插入第=5这行数据时，对5及其以后的范围加了锁，也没有提交，所以这个这里的操作需要进行锁等待
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+MySQL [test]> select * from test ;  #这里可以看到，超时之后，第一个会话最开始在显式事务中插入的几行数据并没有回滚
++------+
+| id   |
++------+
+|    1 |
+|    2 |
+|    3 |
+|    4 |
++------+
+4 rows in set (0.00 sec)
+
+
+##此时，你需要自行决定会话1中插入的数据是要提交，还是需要回滚，当然，如果断开连接，事务会自动回滚，为了方便后续的测试，先在两个会话中都做rollback操作
+
+從上面的結果中可以看到，默認情況下innodb_rollback_on_timeout為OFF，此時超時終止的會話中的事務DML修改的數據不會自動回滾。
+
+現在，把innodb_rollback_on_timeout參數在my.cnf中加入並改為ON，重啟mysql，再次插入相同數據試試看
+
+
+## 第一个会话中显示开启一个事务，插入几行数据，不提交
+MySQL [test]> show variables like '%rollback%';
++----------------------------+-------+
+| Variable_name              | Value |
++----------------------------+-------+
+| innodb_rollback_on_timeout | ON   |
+| innodb_rollback_segments   | 128   |
++----------------------------+-------+
+2 rows in set (0.00 sec)
+
+MySQL [test]> use test
+Database changed
+
+MySQL [test]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]>insert into test(id) values(1),(2),(3),(4);
+Query OK, 1 row affected (0.00 sec)
+
+MySQL [test]> select * from test;
++------+
+| id   |
++------+
+|    1 |
+|    2 |
+|    3 |
+|    4 |
++------+
+4 rows in set (0.00 sec)
+
+## 现在，打开第二个会话，显式开启一个事务，并插入数据5，不提交
+MySQL [(none)]> use test
+Reading table information for completion of table and column names
+You can turn off this feature to get a quicker startup with -A
+MySQL [(none)]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]> insert into test values(5);
+Query OK, 1 row affected (0.00 sec)
+
+MySQL [test]> select * from test;
++------+
+| id   |
++------+
+|    5 |
++------+
+2 rows in set (0.00 sec)
+
+## 再回到第一个会话中，更新id为5的数据行为6
+MySQL [test]> update test set id=6 where id=5;  #因为第二个会话插入第=5这行数据时，对5及其以后的范围加了锁，也没有提交，所以这个这里的操作需要进行锁等待
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+MySQL [test]> select * from test ;  #这里可以看到，超时之后，第一个会话最开始在显式事务中插入的几行数据已经回滚
+Empty set (0.00 sec)
+
+從上面的結果中可以看到，把參數innodb_rollback_on_timeout設置為ON之後（注意，這個變量是只讀變量，需要添加到my.cnf中並重啟mysql），如果一個事務發生鎖等待超時，那麼這個事務沒有提交的數據都會被回滾掉。
+2.3. 鎖定等待超時
+官方描述：
+此變量指定嘗試獲取元數據鎖的超時時間（以秒為單位）。
+這裡不得不提一下2.1小節的innodb_lock_wait_timeout超時參數，相信有不少人是沒有搞太清楚這兩者的區別，從字面上來看，前者是innodb的dml操作的行級鎖的等待時間後面是獲取MDL鎖的等待時間，默認值是31536000秒=1年。那麼，下面來演示一把吧
+
+## 打开第一个会话，显示开启一个会话，执行select...for update语句，不提交事务
+MySQL [test]> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]> select * from test for update;
++------+
+| id   |
++------+
+|    1 |
+|    2 |
+|    3 |
+|    4 |
+|    5 |
++------+
+5 rows in set (0.00 sec)
+
+## 现在，打开第二个会话，修改session lock_wait_timeout=5，并执行DDL语句
+MySQL [test]> set lock_wait_timeout=5;
+Query OK, 0 rows affected (0.00 sec)
+
+MySQL [test]> use test
+Database changed
+
+MySQL [test]> alter table test add column test varchar(100);  #DDL语句执行被阻塞，5秒之后超时终止
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+MySQL [test]> 
+
+從上面的結果中可以看到，DDL語句的超時時間是受lock_wait_timeout參數控制的
+PS：注意，凡是需要獲取MDL鎖的操作都受到這個超時參數的影響，不單單是DDL語句，包含在表上的DML、DDL操作，以及視圖、存儲過程、存儲函數、lock table，flush table with read lock語句等。但不適用於隱式訪問系統表的語句，如：grant和revoke等
+3、複製類超時
+3.1. 延遲插入超時
+官方描述：
+INSERT DELAYED 處理程序線程在終止之前應等待 INSERT 語句多少秒。
+為MyISAM INSERT DELAY設計的超時參數，表示INSERT DELAY handler線程在INSERT DELAY語句終止前等待這個INSERT語句的時間，注意是表示insert delay延遲插入的超時時間，不是insert語句。默認值是300S，從5.6.7開始被棄用（因為delayed insert功能被棄用）後續版本將移除。
+3.2. rpl_semi_sync_master_timeout
+官方描述：
+一個以毫秒為單位的值，它控制主服務器在超時和恢復到異步複製之前等待從服務器確認提交的時間。默認值為 10000（10 秒）。
+只有安裝了主端半同步複製插件，此變量才可用。
+
+為semi-sync複製時，主庫在某次事務提交時，如果等待超過rpl_semi_sync_master_timeout多秒之後仍然沒有接收到任何從庫做回包響應，那麼主庫自動降級為異步複製模式，當主庫探測到有備庫恢復回包時，主庫自動恢復到semi-sync複製模式。默認值為10000毫秒=10秒
+3.3. rpl_stop_slave_timeout
+官方描述：
+在MySQL 5.6.13及之後的版本中，可以通過設置該變量來控制STOP SLAVE在超時前等待的時間長度（以秒為單位）。這可用於避免 STOP SLAVE 和其他使用不同客戶端連接到從屬的從屬 SQL 語句之間的死鎖。rpl_stop_slave_timeout 的最大值和默認值為 31536000 秒（1 年）。最小值為 2 秒。
+5.6.13之後引入的參數，控制stop slave 的執行時間，在重放一個大的事務的時候,突然執行stop slave,命令stop slave會執行很久,這個時候可能產生死鎖或阻塞,嚴重影響性能，可以通過rpl_stop_slave_timeout參數控制stop slave 的執行時間。默認值是31536000秒=1年
+3.4. slave_net_timeout
+官方描述：
+在中止讀取之前等待來自主/從連接的更多數據的秒數。
+Slave判斷主庫是否掛掉的超時設置，在設定時間內依然沒有獲取到Master的回應就認為Master已經掛掉了，後續根據超時重連參數設置進行重連主庫的操作。默認值：3600S
+4、IO類超時
+4.1. innodb_flush_log_at_timeout
+官方描述：
+每 N 秒寫入並刷新一次日誌。innodb_flush_log_at_timeout 是在 MySQL 5.6.6 中引入的。它允許增加刷新之間的超時時間，以減少刷新並避免影響二進制日誌組提交的性能。在 MySQL 5.6.6 之前，刷新頻率是每秒一次。innodb_flush_log_at_timeout 的默認設置也是每秒一次。
+5.6.6引入，參數innodb_flush_log_at_trx_commit=1時，此超時參數不起作用，當innodb_flush_log_at_trx_commit=0/2時才起作用。5.6.6之後表示每innodb_flush_log_at_timeout秒一次的頻率刷新redo log（在5.6.6之前是固定每秒一次刷新redo log，5.6.6之後刷新頻率可以通過這個參數設置，當然，這個參數本身默認值也是1S）。
+作者：小蘿蔔微信公眾號：開源城邦出處：小蘿蔔的博客http://www.cnblogs.com/xiaoboluo768/ 感謝您的認真閱讀。本文版權歸作者所有，歡迎轉載，但請保留該聲明。最新拙作：《千金良方——MySQL性能優化金字塔法則》，京東有售，圖書提供附錄提供電子版免費下載，詳見鏈接：http://www.broadview.com.cn/book/5458 關於此書的代碼段、部分高清大圖和附錄已開源，詳見（覺得有用的話幫忙順手點個星星）：https://github.com/xiaoboluo768/qianjinliangfang 關於此書基礎篇中關於4個系統字典庫全面講解文檔已開源，詳見（覺得有用的話幫忙順手點個星星）：https://github.com/xiaoboluo768/mysql-system-schema
